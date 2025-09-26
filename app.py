@@ -1,117 +1,67 @@
-# app.py
-from flask import Flask, request, jsonify
-import requests
-import binascii
+import re, requests
+from flask import Flask, jsonify, request
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
-import traceback
 
 app = Flask(__name__)
-BASE_URL = "https://pkmkb.free.nf/api.php"
 
-# Hex values copied from the upstream JS
-A_HEX = "f655ba9d09a112d4968c63579db590b4"
-B_HEX = "98344c2eee86c3994890592585b49f80"
-C_HEX = "a0ec2500a5bd2cdf8fdd40b6792072d3"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/117 Safari/537.36",
+    "Referer": "https://pkmkb.free.nf/"
+}
 
-# Convert hex to bytes
-A = bytes.fromhex(A_HEX)
-B = bytes.fromhex(B_HEX)
-C = bytes.fromhex(C_HEX)
+def hexpairs_to_bytes(s):
+    if len(s) % 2 != 0:
+        s = "0" + s
+    return bytes.fromhex(s)
 
-# AES modes to try
-MODE_TRIALS = [
-    ("CBC", AES.MODE_CBC),
-    ("ECB", AES.MODE_ECB),
-    ("CFB", AES.MODE_CFB),
-    ("OFB", AES.MODE_OFB),
-]
+def pkcs7_unpad(b):
+    pad = b[-1]
+    if 1 <= pad <= AES.block_size and b[-pad:] == bytes([pad])*pad:
+        return b[:-pad]
+    return b
 
-def try_decrypt_variants(key_bytes, iv_bytes, cipher_bytes):
-    tried = set()
-    key_iv_pairs = [
-        ("A_key_B_iv", (key_bytes, iv_bytes)),
-        ("B_key_A_iv", (iv_bytes, key_bytes)),
-    ]
+def compute_cookie(url):
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    html = r.text
 
-    for pair_label, (key, iv) in key_iv_pairs:
-        for mode_name, mode_const in MODE_TRIALS:
-            try:
-                cipher = AES.new(key, mode_const, iv=iv if mode_const != AES.MODE_ECB else None)
-                plain = cipher.decrypt(cipher_bytes)
+    # Extract a,b,c
+    hex_matches = re.findall(r'toNumbers\("([0-9a-fA-F]+)"\)', html)
+    if len(hex_matches) < 3:
+        return None, None
+    a_hex, b_hex, c_hex = hex_matches[0], hex_matches[1], hex_matches[2]
 
-                # raw hex
-                cand_raw = binascii.hexlify(plain).decode().lower()
-                if cand_raw not in tried:
-                    tried.add(cand_raw)
-                    yield cand_raw
+    # Extract redirect target
+    m_href = re.search(r'location\.href\s*=\s*"([^"]+)"', html)
+    target_url = m_href.group(1) if m_href else url
 
-                # try PKCS7 unpad
-                try:
-                    p = unpad(plain, AES.block_size)
-                    cand_unp = binascii.hexlify(p).decode().lower()
-                    if cand_unp not in tried:
-                        tried.add(cand_unp)
-                        yield cand_unp
-                except Exception:
-                    pass
-            except Exception:
-                continue
+    # Decrypt c
+    key = hexpairs_to_bytes(a_hex)
+    iv  = hexpairs_to_bytes(b_hex)
+    ct  = hexpairs_to_bytes(c_hex)
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    pt = pkcs7_unpad(cipher.decrypt(ct))
+    cookie_val = pt.hex()
+    return target_url, cookie_val
 
-@app.route("/proxy", methods=["GET"])
+@app.route("/proxy")
 def proxy():
     number = request.args.get("number")
     if not number:
         return jsonify({"error": "Missing number"}), 400
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/115.0 Safari/537.36"
-    }
+    start_url = f"https://pkmkb.free.nf/api.php?number={number}&i=2"
+    target_url, cookie_val = compute_cookie(start_url)
+    if not cookie_val:
+        return jsonify({"error": "Failed to compute cookie"}), 500
 
-    last_response_text = None
-    last_status = None
-    last_headers = None
-
+    cookies = {"__test": cookie_val}
+    resp = requests.get(target_url, headers=HEADERS, cookies=cookies, timeout=15)
     try:
-        for cand_hex in try_decrypt_variants(A, B, C):
-            headers_loc = dict(headers)
-            headers_loc["Cookie"] = f"__test={cand_hex}"
-
-            try:
-                r = requests.get(BASE_URL, params={"number": number, "i": "2"}, headers=headers_loc, timeout=15)
-            except Exception as e:
-                last_response_text = f"request failed: {str(e)}"
-                continue
-
-            last_status = r.status_code
-            last_headers = dict(r.headers)
-            last_response_text = r.text or ""
-
-            # Try parse JSON
-            try:
-                data = r.json()
-                if isinstance(data, dict) and "credit" in data:
-                    data["credit"] = "API OWNER : @frappeash"
-                return jsonify({
-                    "status": "success",
-                    "data": data
-                })
-            except Exception:
-                pass
-
-        # Nothing produced JSON
-        debug = {
-            "error": "No candidate produced JSON response",
-            "last_status": last_status,
-            "last_headers": last_headers,
-            "last_body_preview": (last_response_text[:2000] if last_response_text else None),
-        }
-        return jsonify(debug), 502
-
+        data = resp.json()
+        data["credit"] = "API OWNER : @frappeash & @zioniiix"
+        return jsonify(data)
     except Exception:
-        return jsonify({"error": "Internal error", "trace": traceback.format_exc()}), 500
+        return jsonify({"error": "Not JSON", "preview": resp.text[:500]})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
